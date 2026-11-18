@@ -501,20 +501,29 @@ def pipeline_anomaly_to_exec(anomaly_id: int | None = None) -> PipelineResult:
 # ---------------------------------------------------------------------------
 
 def detect_missed_batches() -> list[dict[str, Any]]:
-    """检测存在遗漏的批次并返回补采建议。"""
-    batches = store.rows("batch_tracker")
+    """检测存在遗漏的批次并返回补采建议。
+
+    以批次完整性报告为准：同时覆盖"有遗漏"状态批次和状态未更新但
+    对账后仍存在缺失项的批次；已被新到达批次恢复的隔离项不再计入。
+    """
+    from app.services.batch_integrity import batch_integrity
+
+    reports, _ = batch_integrity.list_reports(page=1, size=1_000_000)
     missed: list[dict[str, Any]] = []
-    for bt in batches:
-        status = bt.get("status", "")
-        if status == "有遗漏":
-            missed.append({
-                "batch_id": bt.get("id"),
-                "batch_no": bt.get("批次编号", "?"),
-                "target": bt.get("目标条数", "?"),
-                "success": bt.get("成功条数", "?"),
-                "missed": bt.get("遗漏条数", "?"),
-                "trigger_resupply": True,
-            })
+    for report in reports:
+        if report["missing_count"] <= 0:
+            continue
+        missed.append({
+            "batch_id": report["batch_id"],
+            "batch_no": report["batch_ref"],
+            "target": report["target_count"],
+            "success": report["success_count"],
+            "missed": report["missing_count"],
+            "recovered": report["recovered_count"],
+            "flow_breakdown": report["flow_breakdown"],
+            "report_version": report["report_version"],
+            "trigger_resupply": True,
+        })
     return missed
 
 
@@ -543,16 +552,47 @@ def trigger_resupply(missed: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def pipeline_batch_resupply() -> dict[str, Any]:
-    """批次遗漏 → 补采触发的完整处理。"""
+    """批次遗漏 → 补采触发的完整处理（按流程归属生成补采清单）。"""
+    from app.services.batch_integrity import batch_integrity
+
     missed = detect_missed_batches()
     if not missed:
         return {"missed_count": 0, "resupply_tasks": [], "ok": True}
-    tasks = trigger_resupply(missed)
+
+    plans: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for batch_info in missed:
+        report = batch_integrity.build_report(batch_info["batch_no"])
+        if report is None:
+            continue
+        ownership = report.get("ownership")
+        for group in report["flow_breakdown"]:
+            flow = group["flow"]
+            # 有归属时从责任归属派发；无归属时只为本批次所属流程生成初版清单
+            if ownership and ownership.get("owner_flow") != flow:
+                skipped.append({"batch_ref": report["batch_ref"], "flow": flow,
+                                "reason": "由其他责任流程统一认领"})
+                continue
+            if not ownership and flow != report["flow"]:
+                skipped.append({"batch_ref": report["batch_ref"], "flow": flow,
+                                "reason": "外部隔离待归属"})
+                continue
+            result = batch_integrity.create_resupply_plan(
+                report["batch_ref"], flow=flow,
+                owner_person=f"{flow}-值班责任人",
+                actor="pipeline", actor_role="admin", actor_flow=flow,
+                report_version=report["report_version"],
+            )
+            if result.get("ok") and result.get("plan"):
+                plans.append(result["plan"])
+
     return {
         "missed_count": len(missed),
-        "resupply_tasks": len(tasks),
-        "ok": len(tasks) > 0,
+        "resupply_tasks": len(plans),
+        "ok": len(plans) > 0,
         "details": missed,
+        "plans": plans,
+        "skipped": skipped,
     }
 
 

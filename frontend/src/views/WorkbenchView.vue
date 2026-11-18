@@ -6,6 +6,14 @@
         <p class="page-desc">{{ meta.desc }}</p>
       </div>
       <div class="page-actions">
+        <RouterLink
+          v-if="meta.key === 'batch_tracker'"
+          class="btn"
+          data-testid="open-integrity"
+          to="/batch_tracker/integrity"
+        >
+          批次完整性报告
+        </RouterLink>
         <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">
           登记{{ meta.entity }}
         </button>

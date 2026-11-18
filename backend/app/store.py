@@ -135,6 +135,9 @@ class DirtyRecord:
     detected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     quarantined: bool = True
     recovered_to: str | None = None
+    # 责任归属：隔离记录属于哪个流程，用于批次完整性对账
+    flow: str = ""
+    record_key: str = ""
 
 
 class DirtyDataVault:
@@ -158,15 +161,32 @@ class DirtyDataVault:
             return len(self._records)
 
     def quarantine(self, source: str, batch_ref: str,
-                   raw_data: dict[str, Any], reason: str) -> DirtyRecord:
+                   raw_data: dict[str, Any], reason: str,
+                   flow: str = "", record_key: str = "") -> DirtyRecord:
         with self._lock:
             self._seq += 1
             rec = DirtyRecord(
                 record_id=self._seq, source_module=source,
                 batch_ref=batch_ref, raw_data=raw_data, reason=reason,
+                flow=flow, record_key=record_key,
             )
             self._records.append(rec)
             return rec
+
+    def restore(self, source: str, batch_ref: str,
+                raw_data: dict[str, Any], reason: str,
+                flow: str = "", record_key: str = "",
+                quarantined: bool = True,
+                recovered_to: str | None = None) -> DirtyRecord:
+        """按示例数据回填隔离记录（保留既有的恢复状态）。"""
+        rec = self.quarantine(
+            source=source, batch_ref=batch_ref, raw_data=raw_data,
+            reason=reason, flow=flow, record_key=record_key,
+        )
+        with self._lock:
+            rec.quarantined = quarantined
+            rec.recovered_to = recovered_to
+        return rec
 
     def list_by_source(self, source: str) -> list[DirtyRecord]:
         with self._lock:
@@ -212,6 +232,7 @@ class CollectEntry:
     collected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     validated: bool = False
     quality_score: float = 1.0
+    record_key: str = ""
 
 
 class CollectRecordStore:
@@ -234,15 +255,25 @@ class CollectRecordStore:
             return len(self._entries)
 
     def add(self, batch_ref: str, source: str,
-            fields: dict[str, Any]) -> CollectEntry:
+            fields: dict[str, Any], record_key: str = "") -> CollectEntry:
         with self._lock:
             self._seq += 1
             entry = CollectEntry(
                 entry_id=self._seq, batch_ref=batch_ref,
                 source_module=source, fields=dict(fields),
+                record_key=record_key,
             )
             self._entries.append(entry)
             return entry
+
+    def restore(self, batch_ref: str, source: str,
+                fields: dict[str, Any], record_key: str = "",
+                validated: bool = False) -> CollectEntry:
+        entry = self.add(batch_ref=batch_ref, source=source,
+                         fields=fields, record_key=record_key)
+        with self._lock:
+            entry.validated = validated
+        return entry
 
     def list_by_batch(self, batch_ref: str) -> list[CollectEntry]:
         with self._lock:
@@ -359,6 +390,226 @@ class FailureRecovery:
 
 
 # ---------------------------------------------------------------------------
+# 补采到达批次 & 批次完整性归属 (ResupplyArrival / BatchIntegrityRegistry)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ResupplyArrival:
+    """新到达批次把某个来源批次的隔离记录恢复回来的凭据。"""
+    arrival_id: int
+    new_batch_ref: str
+    source_batch_ref: str
+    quarantine_record_id: int
+    recovered_key: str
+    flow: str
+    arrived_at: str
+    handled_by: str
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class ResupplyArrivalLedger:
+    """补采到达台账：记录"新到达批次 → 来源批次隔离记录"的恢复关系。
+
+    用途：批次追踪在计算遗漏时，必须把已由新到达批次恢复的隔离项剔除，
+    否则会重复生成补采任务。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._records: list[ResupplyArrival] = []
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    def add(self, new_batch_ref: str, source_batch_ref: str,
+            quarantine_record_id: int, recovered_key: str, flow: str,
+            arrived_at: str, handled_by: str) -> ResupplyArrival:
+        with self._lock:
+            self._seq += 1
+            record = ResupplyArrival(
+                arrival_id=self._seq, new_batch_ref=new_batch_ref,
+                source_batch_ref=source_batch_ref,
+                quarantine_record_id=quarantine_record_id,
+                recovered_key=recovered_key, flow=flow,
+                arrived_at=arrived_at, handled_by=handled_by,
+            )
+            self._records.append(record)
+            return record
+
+    def list_for_batch(self, batch_ref: str) -> list[ResupplyArrival]:
+        """同时返回"作为来源"和"作为新到达批次"的台账。"""
+        with self._lock:
+            return [
+                r for r in self._records
+                if r.source_batch_ref == batch_ref or r.new_batch_ref == batch_ref
+            ]
+
+    def list_all(self) -> list[ResupplyArrival]:
+        with self._lock:
+            return list(self._records)
+
+    def found_for(self, source_batch_ref: str, recovered_key: str) -> ResupplyArrival | None:
+        with self._lock:
+            for r in self._records:
+                if (r.source_batch_ref == source_batch_ref
+                        and r.recovered_key == recovered_key):
+                    return r
+            return None
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            by_flow: dict[str, int] = {}
+            for r in self._records:
+                by_flow[r.flow] = by_flow.get(r.flow, 0) + 1
+            return {
+                "total": len(self._records),
+                "by_flow": by_flow,
+                "new_batches": len({r.new_batch_ref for r in self._records}),
+            }
+
+
+@dataclass
+class OwnershipDecision:
+    """批次补采归属：只能有一个最终责任人；拆分/冻结两种路径共用此结构。"""
+    batch_ref: str
+    mode: str                      # split = 按流程拆分, freeze = 整批冻结
+    owner_flow: str                # 发起/认领流程
+    owner_person: str              # 唯一最终责任人
+    item_scopes: dict[str, list[str]] = field(default_factory=dict)  # 流程 -> 记录键
+    version: int = 1
+    decided_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    decided_by: str = ""
+    conflict: bool = False
+    conflict_detail: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "batch_ref": self.batch_ref,
+            "mode": self.mode,
+            "mode_label": "按流程拆分" if self.mode == "split" else "整批冻结统一认领",
+            "owner_flow": self.owner_flow,
+            "owner_person": self.owner_person,
+            "item_scopes": {k: list(v) for k, v in self.item_scopes.items()},
+            "version": self.version,
+            "decided_at": self.decided_at,
+            "decided_by": self.decided_by,
+            "conflict": self.conflict,
+            "conflict_detail": self.conflict_detail,
+        }
+
+
+@dataclass
+class ResupplyPlan:
+    """处理项丁：按批次完整性报告版本生成的补采任务清单。"""
+    plan_id: int
+    batch_ref: str
+    version: int                   # 处理项丁版本
+    report_version: int            # 生成时的报告版本
+    flow: str                      # 只为本流程缺失项生成
+    owner_person: str
+    scope_keys: list[str] = field(default_factory=list)
+    scope_batches: list[str] = field(default_factory=list)
+    scope_count: int = 0
+    task_ref: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    created_by: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "batch_ref": self.batch_ref,
+            "version": self.version,
+            "report_version": self.report_version,
+            "flow": self.flow,
+            "owner_person": self.owner_person,
+            "scope_keys": list(self.scope_keys),
+            "scope_batches": list(self.scope_batches),
+            "scope_count": self.scope_count,
+            "task_ref": self.task_ref,
+            "created_at": self.created_at,
+            "created_by": self.created_by,
+        }
+
+
+class BatchIntegrityRegistry:
+    """批次完整性归属与补采版本台账。
+
+    - 每个批次只允许一条 OwnershipDecision（最终责任人唯一）
+    - 每次归属/冻结变更会推进 report_version
+    - 补采任务清单按批次+流程分版本累积，可回查历史版本
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ownership: dict[str, OwnershipDecision] = {}
+        self._plans: list[ResupplyPlan] = []
+        self._plan_seq = 0
+        self._report_versions: dict[str, int] = {}
+
+    def report_version(self, batch_ref: str) -> int:
+        with self._lock:
+            return self._report_versions.get(batch_ref, 1)
+
+    def bump_report_version(self, batch_ref: str) -> int:
+        with self._lock:
+            self._report_versions[batch_ref] = self._report_versions.get(batch_ref, 1) + 1
+            return self._report_versions[batch_ref]
+
+    def get_ownership(self, batch_ref: str) -> OwnershipDecision | None:
+        with self._lock:
+            return self._ownership.get(batch_ref)
+
+    def list_ownership(self) -> list[OwnershipDecision]:
+        with self._lock:
+            return list(self._ownership.values())
+
+    def set_ownership(self, decision: OwnershipDecision) -> OwnershipDecision:
+        with self._lock:
+            self._ownership[decision.batch_ref] = decision
+            self._report_versions[decision.batch_ref] = (
+                self._report_versions.get(decision.batch_ref, 1) + 1)
+            return decision
+
+    def plans_for(self, batch_ref: str, flow: str | None = None) -> list[ResupplyPlan]:
+        with self._lock:
+            plans = [p for p in self._plans if p.batch_ref == batch_ref]
+            if flow:
+                plans = [p for p in plans if p.flow == flow]
+            return plans
+
+    def latest_plan(self, batch_ref: str, flow: str | None = None) -> ResupplyPlan | None:
+        plans = self.plans_for(batch_ref, flow)
+        return plans[-1] if plans else None
+
+    def next_plan_version(self, batch_ref: str, flow: str) -> int:
+        with self._lock:
+            versions = [
+                p.version for p in self._plans
+                if p.batch_ref == batch_ref and p.flow == flow
+            ]
+            return max(versions, default=0) + 1
+
+    def add_plan(self, plan: ResupplyPlan) -> ResupplyPlan:
+        with self._lock:
+            self._plan_seq += 1
+            plan.plan_id = self._plan_seq
+            self._plans.append(plan)
+            return plan
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "owned_batches": len(self._ownership),
+                "conflicts": sum(1 for d in self._ownership.values() if d.conflict),
+                "plans": len(self._plans),
+                "report_versions": dict(self._report_versions),
+            }
+
+
+# ---------------------------------------------------------------------------
 # 增强版 Store — 整合通道、脏数据、采集记录、恢复
 # ---------------------------------------------------------------------------
 
@@ -372,6 +623,12 @@ class Store:
         self.dirty_vault = DirtyDataVault()
         self.collect_records = CollectRecordStore()
         self.recovery = FailureRecovery()
+        # 批次完整性对账基础设施
+        self.arrivals = ResupplyArrivalLedger()
+        self.batch_integrity = BatchIntegrityRegistry()
+        # 补齐批次对账三源（采集记录、隔离记录、补采到达台账）的示例数据
+        from app.seed_batches import seed_batch_integrity
+        seed_batch_integrity(self)
 
     # ---- 基础数据操作 ----
 

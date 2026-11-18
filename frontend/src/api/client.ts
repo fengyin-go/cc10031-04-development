@@ -19,3 +19,17 @@ export async function fetchJson<T>(path: string): Promise<T> {
   }
   return (await response.json()) as T
 }
+
+/** POST 封装：把后端 detail 透出成可读提示，403/409 也走同一套文案。 */
+export async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const response = await request(path, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    const detail = (payload as { detail?: string } | null)?.detail
+    throw new Error(detail ?? `接口返回 ${response.status}，操作未生效`)
+  }
+  return payload as T
+}

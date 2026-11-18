@@ -29,3 +29,41 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class BatchReportPage(PageResult[dict]):
+    """批次完整性报告分页结果。"""
+
+
+class BatchOwnershipPayload(BaseModel):
+    mode: str = Field(default="split", description="split 按流程拆分 / freeze 整批冻结")
+    owner_flow: str
+    owner_person: str
+    actor: str = ""
+    actor_role: str = Field(default="flow_owner", description="viewer / flow_owner / admin")
+    actor_flow: str = ""
+
+
+class BatchOwnershipResult(BaseModel):
+    ok: bool
+    message: str
+    conflict: bool = False
+    ownership: dict[str, Any] | None = None
+    recovery_stage: dict[str, Any] | None = None
+    report: dict[str, Any] | None = None
+
+
+class BatchConflictPayload(BaseModel):
+    keep_owner_person: str = ""
+    actor: str = ""
+    actor_role: str = Field(default="admin", description="只有 admin 可以裁决冲突")
+
+
+class BatchResupplyPayload(BaseModel):
+    flow: str
+    owner_person: str = ""
+    actor: str = ""
+    actor_role: str = Field(default="flow_owner", description="viewer / flow_owner / admin")
+    actor_flow: str = ""
+    report_version: int | None = Field(
+        default=None, description="处理项丁必须基于该版本的批次完整性报告生成")

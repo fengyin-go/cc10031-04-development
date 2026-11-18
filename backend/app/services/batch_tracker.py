@@ -44,9 +44,16 @@ class BatchTrackerService(BaseModuleService):
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         rows = store.rows(self.MODULE)
+        from app.services.batch_integrity import batch_integrity
+
+        integrity = batch_integrity.domain_snapshot()
         return {
             **base,
             "completed_batches": sum(1 for r in rows if r.get("status") == "已完成"),
             "missed_batches": sum(1 for r in rows if r.get("status") == "有遗漏"),
             "in_progress": sum(1 for r in rows if r.get("status") in ("收集中", "已收集", "校验中")),
+            "integrity_reports": integrity["reports"],
+            "integrity_complete": integrity["complete"],
+            "integrity_missed": integrity["missed"],
+            "pending_missing_items": integrity["missing_items"],
         }
